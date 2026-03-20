@@ -1,0 +1,51 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Logs and outputs
+output.mp3
+output_*.mp3
+*.log
+
+# TTS Module (Ignoring Coqui TTS source repository if present in the root folder)
+/TTS/
+/API/
+/Repository/
+/dockerfiles/
+/docs/
+/hubconf.py
+/notebooks/
+/recipes/
+/scripts/
+/tests/
+Makefile
+.pylintrc
+.readthedocs.yml
+.pre-commit-config.yaml
+.cardboardlint.yml
+CITATION.cff
+CODE_OF_CONDUCT.md
+CODE_OWNERS.rst
+CONTRIBUTING.md
+MANIFEST.in
+
+# Apple
+.DS_Store
+
+# Editor
+.vscode/
+*.code-workspace
+.idea/

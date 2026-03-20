@@ -1,0 +1,7 @@
+fastapi[all]
+uvicorn
+pymongo
+boto3
+pydub
+TTS
+torch
