@@ -1,66 +1,59 @@
+"""HTTP API for synchronous voice generation."""
+
+import logging
+import os
+import uuid
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import uuid
-import os
+
+from src import config
 from src.services import generate_and_merge_tts, upload_to_s3
-from src.core import get_s3_client
+from src.voices import resolve_voice, voice_names
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
+logger = logging.getLogger(__name__)
 app = FastAPI(title="Voice Cloner API")
 
-# Ensure the local S3 bucket exists
-try:
-    s3 = get_s3_client()
-    s3.create_bucket(Bucket='my-local-bucket')
-except Exception:
-    pass
 
 class TextInput(BaseModel):
     text: str
     name: str
     language: str
 
-@app.get('/')
-async def root():
+
+@app.get("/")
+def root():
     return {"message": "Voice Cloner API is running."}
 
-@app.post('/generate_tts')
+
+@app.get("/voices")
+def voices():
+    return {"voices": voice_names(), "languages": list(config.SUPPORTED_LANGUAGES)}
+
+
+@app.post("/generate_tts")
 def generate_tts(item: TextInput):
-    text = item.text
-    name = item.name.upper()
-    language = item.language.upper()
-    
-    list_of_names = ["SHUBHAM", "SUDHIR", "GARV"]
-    list_of_languages = ["ENGLISH", "HINDI"]
+    text = item.text.strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="Text must not be empty")
+    if len(text) > config.MAX_TEXT_LENGTH:
+        raise HTTPException(status_code=422, detail=f"Text exceeds {config.MAX_TEXT_LENGTH} characters")
 
-    if not text.strip() or not name.strip() or not language.strip():
-        return {"Error:" : "One or more requirements not provided"}
-    if name not in list_of_names:
-        return {"Error:" : "Name not available in the database"}
-    if language not in list_of_languages:
-        return {"Error:" : "Language not available to be cloned"}
-    
-    if name == "SHUBHAM":
-        audio = os.path.join(BASE_DIR, "voices", "shubham.mp3")
-    elif name == "SUDHIR":
-        audio = os.path.join(BASE_DIR, "voices", "sudhir.mp3")
-    else:
-        audio = os.path.join(BASE_DIR, "voices", "garv.mp3")
+    speaker_path = resolve_voice(item.name)
+    if speaker_path is None:
+        raise HTTPException(status_code=422, detail="Unknown voice; see GET /voices")
+    language = config.SUPPORTED_LANGUAGES.get(item.language.strip().upper())
+    if language is None:
+        raise HTTPException(status_code=422, detail="Unsupported language; see GET /voices")
 
-    # Map language
-    lang_code = "en" if language == "ENGLISH" else "hi"
-    
+    output_path = None
     try:
-        merged_output_path = generate_and_merge_tts(text, audio, lang_code)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
-    bucket_name = 'my-local-bucket'
-    object_name = f'output_{uuid.uuid4().hex}.mp3'
-
-    try:
-        file_url = upload_to_s3(merged_output_path, bucket_name, object_name)
-        return {"message": "Audio generated and uploaded to S3", "file_url": file_url}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error uploading to S3: {str(e)}")
+        output_path = generate_and_merge_tts(text, speaker_path, language)
+        url = upload_to_s3(output_path, config.S3_BUCKET, f"output_{uuid.uuid4().hex}.mp3")
+    except Exception as exc:
+        logger.exception("Voice generation failed")
+        raise HTTPException(status_code=500, detail="Voice generation failed") from exc
+    finally:
+        if output_path and os.path.exists(output_path):
+            os.unlink(output_path)
+    return {"message": "Audio generated and uploaded to S3", "file_url": url}

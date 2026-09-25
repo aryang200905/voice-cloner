@@ -1,42 +1,52 @@
 # Voice Cloner API
 
-This project provides a Voice Cloning service utilizing `TTS` (Coqui-AI), FastAPI, and MongoDB. It allows users to clone specific voices and generate text-to-speech audio outputs that are stored in local S3 (via LocalStack) and managed through a MongoDB database.
+Generate English or Hindi speech with a reference voice using Coqui XTTS v2. The FastAPI endpoint generates audio immediately; a separate MongoDB worker handles queued jobs. Both upload MP3 output to an S3-compatible bucket and return a download URL that expires after one hour by default.
 
-## Features
-- **Voice Cloning Generation:** Generate accurate text-to-speech in English and Hindi.
-- **REST API:** A FastAPI service for interacting directly with the TTS models.
-- **MongoDB Worker:** A polling worker that processes asynchronous jobs stored in a MongoDB collection.
-- **S3 Integration:** Uploads generated `.mp3` files to an S3-compatible service (LocalStack default) and generates pre-signed download URLs.
+## Setup
 
-## Project Structure
-- `src/api.py`: The FastAPI application exposing the `/generate_tts` endpoint.
-- `src/worker.py`: A MongoDB polling script that processes audio generation requests in the background.
-- `src/create_bucket.py`: A utility script to initialize a local S3 bucket.
-- `voices/`: Directory containing voice sample `.mp3` files (e.g., `garv.mp3`, `sudhir.mp3`, etc.).
-- `examples/`: Sample FastAPI applications for testing purposes.
+Use a Python environment supported by your Coqui TTS installation. Install `ffmpeg` and `ffprobe` on the system path, then install the Python dependencies:
 
-## Requirements
-To install the dependencies, you can use:
 ```sh
-pip install fastapi[all] uvicorn pymongo boto3 pydub torch TTS
-```
-*Note: Depending on your hardware (CPU vs CUDA), please consult the official PyTorch installation guide.*
-
-## Usage
-### Running the FastAPI Service
-```sh
-uvicorn src.api:app --reload
-```
-You can access the API documentation at `http://localhost:8000/docs`.
-
-### Running the MongoDB Worker
-To start polling the database and generating audio sequentially:
-```sh
-python src/worker.py
+python -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-### Local S3 Setup
-If you do not have an actual AWS S3 bucket, it is configured to use LocalStack. Ensure LocalStack is running and execute:
+Coqui's XTTS model must be downloaded on first use. Review and accept its model license using Coqui's normal setup process before running the service unattended. The service does not accept the license for you.
+
+By default, storage points at LocalStack on `http://localhost:4566`. Start LocalStack with S3 enabled, create the bucket, and start the API from the repository root:
+
 ```sh
-python src/create_bucket.py
+python -m src.create_bucket
+uvicorn src.api:app --host 127.0.0.1 --port 8000
 ```
+
+The API docs are at `http://127.0.0.1:8000/docs`. `GET /voices` lists usable reference files and languages. `POST /generate_tts` accepts JSON such as:
+
+```json
+{"text": "Hello, how are you?", "name": "garv", "language": "English"}
+```
+
+Voice names come from nonempty `.mp3` or `.wav` files in `voices/`, excluding files named `output*`. The included reference names are `garv`, `sameer`, `sanjay`, `sanjeev`, and `sudhir`. Add a properly licensed voice sample there to make another name available. Clear, clean speech in the target voice makes a better reference than noisy or mixed audio. Keep any voice data and output in accordance with consent and applicable rights.
+
+## Queue worker
+
+Start MongoDB, then run:
+
+```sh
+python -m src.worker
+```
+
+The worker reads the `voiceCloning.inputs` collection by default. A request needs `user_id` (positive integer), `text`, `voice_id`, and `language` (`English` or `Hindi`). It claims records with missing, null, `"0"`, or `"pending"` status and processes the lowest `id` first. Its status values are `"1"` (claimed), `"2"` (generating), `"3"` (uploading), `"4"` (complete), and `"failed"`. Completed jobs keep `audio_link`; failed jobs keep `error`. To retry a failed or interrupted job, set its status back to `"pending"` after checking whether the previous run uploaded an object. On success, the worker also writes `audio_link` and increments `edit_flag` in the matching `projects` record.
+
+## Configuration
+
+Set environment variables before starting the process. See [.env.example](.env.example) for defaults. The file is a reference; it is not loaded automatically. Set `S3_ENDPOINT_URL` to an empty string to use the normal AWS endpoint and credentials from the AWS credential chain. Generated audio uses per-request temporary files and removes them after upload.
+
+## Tests
+
+```sh
+python -m unittest discover -s tests
+```
+
+The lightweight tests do not download the model or require MongoDB or S3. A full end-to-end run requires those services, the Python dependencies, the model, and a working `ffmpeg` installation.

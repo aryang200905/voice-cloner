@@ -30,7 +30,6 @@ output_*.mp3
 /notebooks/
 /recipes/
 /scripts/
-/tests/
 Makefile
 .pylintrc
 .readthedocs.yml

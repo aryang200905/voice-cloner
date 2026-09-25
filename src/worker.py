@@ -1,97 +1,89 @@
+"""MongoDB polling worker for asynchronous voice requests."""
+
+import logging
+import os
 import time
 import uuid
-from pymongo import MongoClient
-import sys
-import os
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if BASE_DIR not in sys.path:
-    sys.path.append(BASE_DIR)
+from pymongo import MongoClient, ReturnDocument
 
+from src import config
 from src.services import generate_and_merge_tts, upload_to_s3
-from src.core import get_s3_client
+from src.voices import resolve_voice
 
-# Ensure the local S3 bucket exists
-try:
-    s3 = get_s3_client()
-    s3.create_bucket(Bucket='my-local-bucket')
-except Exception:
-    pass
+logger = logging.getLogger(__name__)
+
+# Legacy producers omit status; newer producers may use 0 or pending.
+_PENDING = {"$or": [
+    {"status": {"$exists": False}}, {"status": None},
+    {"status": "0"}, {"status": "pending"},
+]}
+
+
+def process_one(audios_collection, projects_collection) -> bool:
+    """Atomically claim and process one queued job; return whether one was found."""
+    document = audios_collection.find_one_and_update(
+        _PENDING, {"$set": {"status": "1"}},
+        sort=[("id", 1), ("_id", 1)], return_document=ReturnDocument.AFTER,
+    )
+    if document is None:
+        return False
+
+    job_id = document["_id"]
+    output_path = None
+    try:
+        user_id = int(document.get("user_id"))
+        if user_id <= 0:
+            raise ValueError("user_id must be positive")
+        text = document.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("Text must not be empty")
+        if len(text) > config.MAX_TEXT_LENGTH:
+            raise ValueError(f"Text exceeds {config.MAX_TEXT_LENGTH} characters")
+        language = config.SUPPORTED_LANGUAGES.get(str(document.get("language", "")).strip().upper())
+        if language is None:
+            raise ValueError("Unsupported language")
+        speaker_path = resolve_voice(str(document.get("voice_id", "")))
+        if speaker_path is None:
+            raise ValueError("Unknown voice")
+
+        audios_collection.update_one({"_id": job_id}, {"$set": {"status": "2"}})
+        output_path = generate_and_merge_tts(text.strip(), speaker_path, language)
+        audios_collection.update_one({"_id": job_id}, {"$set": {"status": "3"}})
+        url = upload_to_s3(output_path, config.S3_BUCKET, f"output_{uuid.uuid4().hex}.mp3")
+
+        projects_collection.update_one(
+            {"user_id": user_id},
+            {"$set": {"audio_link": url}, "$inc": {"edit_flag": 1}},
+        )
+        audios_collection.update_one(
+            {"_id": job_id}, {"$set": {"status": "4", "audio_link": url}, "$unset": {"error": ""}},
+        )
+    except Exception as exc:
+        logger.exception("Audio job %s failed", job_id)
+        # Retain failed requests so they can be inspected and explicitly retried.
+        audios_collection.update_one(
+            {"_id": job_id}, {"$set": {"status": "failed", "error": str(exc)}},
+        )
+    finally:
+        if output_path and os.path.exists(output_path):
+            os.unlink(output_path)
+    return True
+
 
 def generate_audio(audios_collection, projects_collection):
-    print("Worker started: Polling MongoDB for audio generation requests...")
+    logger.info("Worker started")
     while True:
-        document = audios_collection.find_one({}, sort=[('id', 1)])
-        if document:
-            audios_collection.update_one({"_id": document['_id']}, {"$set": {"status": "1"}})
-            
-            try:
-                audio_id = int(document.get('user_id', 0))
-            except (ValueError, TypeError):
-                audio_id = 0
-                
-            language = document.get('language') or ''
-            language = str(language).upper()
-            
-            text = document.get('text') or ''
-            text = str(text)
-            
-            name = document.get('voice_id') or ''
-            name = str(name).lower()
-            
-            list_of_languages = ["ENGLISH", "HINDI"]
-            
-            # Validation
-            if len(text.strip()) == 0 or audio_id <= 0 or len(language.strip()) == 0:
-                document2 = projects_collection.find_one({'user_id': audio_id})
-                if document2:
-                    projects_collection.update_one({"_id": document2['_id']}, {"$set": {"audio_link": "Error: One or more requirements not provided"}})
-                audios_collection.delete_one({'_id': document['_id']})
-                continue
-                
-            if language not in list_of_languages:
-                document2 = projects_collection.find_one({'user_id': audio_id})
-                if document2:
-                    projects_collection.update_one({"_id": document2['_id']}, {"$set": {"audio_link": "Error: Language not available to be cloned"}})
-                audios_collection.delete_one({'_id': document['_id']})
-                continue
-                
-            # Transition to generating state
-            audios_collection.update_one({"_id": document['_id']}, {"$set": {"status": "2"}})
-            
-            # Determine params
-            lang_code = "en" if language == "ENGLISH" else "hi"
-            audio_path = os.path.join(BASE_DIR, "voices", f"{name}.mp3")
-            
-            try:
-                # Generate, merge and upload
-                merged_output_path = generate_and_merge_tts(text, audio_path, lang_code)
-                audios_collection.update_one({"_id": document['_id']}, {"$set": {"status": "3"}})
-                
-                bucket_name = 'my-local-bucket'
-                object_name = f'output_{uuid.uuid4().hex}.mp3'
-                
-                # Upload
-                file_url = upload_to_s3(merged_output_path, bucket_name, object_name)
-                
-                # Update frontend collections
-                document2 = projects_collection.find_one({'user_id': audio_id})
-                if document2:
-                    projects_collection.update_one({"_id": document2['_id']}, {"$set": {"audio_link": file_url}})
-                    projects_collection.update_one({"_id": document2['_id']}, {"$set": {"edit_flag": document2.get('edit_flag', 0) + 1}})
-                
-                # Update final status
-                audios_collection.update_one({"_id": document['_id']}, {"$set": {"status": "4"}})
-            except Exception as e:
-                print(f"Error processing audio request for {audio_id}: {e}")
-                
-            # Cleanup request
-            audios_collection.delete_one({'_id': document['_id']})
-        else:
-            time.sleep(15)
+        try:
+            if not process_one(audios_collection, projects_collection):
+                time.sleep(config.WORKER_POLL_INTERVAL)
+        except Exception:
+            logger.exception("Worker polling failed")
+            time.sleep(config.WORKER_POLL_INTERVAL)
+
 
 if __name__ == "__main__":
-    # Initialize MongoDB client and start the worker
-    client = MongoClient('mongodb://127.0.0.1:27017/')
-    db = client['voiceCloning']
-    generate_audio(db['inputs'], db['projects'])
+    logging.basicConfig(level=logging.INFO)
+    with MongoClient(config.MONGO_URI) as client:
+        db = client[config.MONGO_DB]
+        generate_audio(db[config.MONGO_INPUTS_COLLECTION], db[config.MONGO_PROJECTS_COLLECTION])
